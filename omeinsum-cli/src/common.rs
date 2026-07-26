@@ -288,7 +288,7 @@ where
     validate_labels(&parsed.ixs, &parsed.iy, &size_dict)?;
     validate_tensor_dimensions(tensors, &parsed.ixs, &size_dict)?;
     let mut leaf_counts = vec![0usize; tensors.len()];
-    validate_tree(&topology.tree, tensors.len(), &size_dict, &mut leaf_counts)?;
+    validate_tree(&topology.tree, &parsed.ixs, &size_dict, &mut leaf_counts)?;
     for (tensor_index, count) in leaf_counts.into_iter().enumerate() {
         if count != 1 {
             return Err(format!(

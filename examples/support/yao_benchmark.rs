@@ -23,11 +23,19 @@ pub struct YaoTensor {
     pub data_im: Vec<f64>,
 }
 
+fn default_dtype() -> String {
+    "f32".into()
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct BenchmarkNetwork {
     pub format: String,
     pub source_format: String,
     pub source_mode: String,
+    // W4: artifact scalar dtype ("f32" default; "c64" keeps the yao-TN's f64
+    // gate data for the native-complex reference runs).
+    #[serde(default = "default_dtype")]
+    pub dtype: String,
     pub optimizer: OptimizerConfig,
     pub slicer: SlicerConfig,
     pub eincode: BenchmarkEinCode,
@@ -47,6 +55,20 @@ pub struct OptimizerConfig {
     pub niters: usize,
     pub sc_target: f64,
     pub seed_base: u64,
+    // Green-aware second-stage annealing (W2). Zero/empty for plain TreeSA
+    // artifacts; serde defaults keep pre-W2 artifacts readable.
+    #[serde(default)]
+    pub anneal_steps: usize,
+    #[serde(default)]
+    pub anneal_t0: f64,
+    #[serde(default)]
+    pub anneal_t1: f64,
+    #[serde(default)]
+    pub anneal_seeds: Vec<u64>,
+    #[serde(default)]
+    pub merge_factor: f64,
+    #[serde(default)]
+    pub ride_factor: f64,
 }
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct SlicerConfig {
@@ -65,8 +87,16 @@ pub struct BenchmarkEinCode {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct BenchmarkTensor {
     pub shape: Vec<usize>,
+    // W4: f32 payloads are empty when the artifact dtype is c64 (the f64
+    // arrays below carry the data); serde defaults keep this readable.
+    #[serde(default)]
     pub data_re: Vec<f32>,
+    #[serde(default)]
     pub data_im: Vec<f32>,
+    #[serde(default)]
+    pub data_re_f64: Option<Vec<f64>>,
+    #[serde(default)]
+    pub data_im_f64: Option<Vec<f64>>,
     pub structurally_complex: bool,
 }
 #[derive(Default, Serialize, Deserialize, Clone)]
@@ -192,8 +222,24 @@ impl BenchmarkNetwork {
                 }
             }
             let elements = tensor.shape.iter().product::<usize>();
-            if tensor.data_re.len() != elements || tensor.data_im.len() != elements {
-                return Err(format!("leaf {i} data length does not match its shape"));
+            match self.dtype.as_str() {
+                "c64" => {
+                    let (re, im) = tensor
+                        .data_re_f64
+                        .as_ref()
+                        .zip(tensor.data_im_f64.as_ref())
+                        .ok_or_else(|| format!("leaf {i} is missing its c64 payload"))?;
+                    if re.len() != elements || im.len() != elements {
+                        return Err(format!(
+                            "leaf {i} c64 data length does not match its shape"
+                        ));
+                    }
+                }
+                _ => {
+                    if tensor.data_re.len() != elements || tensor.data_im.len() != elements {
+                        return Err(format!("leaf {i} data length does not match its shape"));
+                    }
+                }
             }
         }
         fn validate_labels(
@@ -425,6 +471,55 @@ mod tests {
         );
         assert_eq!((a.pass_nodes, a.ride_nodes, a.merge_nodes), (1, 1, 1));
         assert!((a.predicted_overhead - (1.0 + 2.0 * a.m + a.r)).abs() < 1e-12);
+    }
+
+    // W2 spec test (iii): the annealer's own (m, r) bookkeeping must agree
+    // with audit_tree on the exported NestedEinsum.
+    #[test]
+    fn green_anneal_audit_matches_annealer_bookkeeping() {
+        use omeco::{green_pipeline, EinCode, GreenAnnealer, TreeSA};
+        // 16-tensor ring + 4 chords, mixed structural complexity.
+        let nt = 16usize;
+        let mut ixs: Vec<Vec<usize>> = (0..nt).map(|i| vec![i, (i + 1) % nt]).collect();
+        for (a, b) in [(2usize, 9usize), (5, 13), (0, 7), (11, 4)] {
+            let l = ixs.iter().flatten().max().unwrap() + 1;
+            ixs[a].push(l);
+            ixs[b].push(l);
+        }
+        let nlabels = ixs.iter().flatten().max().unwrap() + 1;
+        let is_complex: Vec<bool> = (0..nt).map(|i| (i * 7 + 3) % 5 < 2).collect();
+        let code = EinCode::new(ixs, vec![]);
+        let sizes: HashMap<usize, usize> = (0..nlabels).map(|l| (l, 2)).collect();
+        let config = GreenAnnealer::default()
+            .with_nsteps(3_000)
+            .with_initializer(TreeSA::fast());
+        let outcome = green_pipeline(&code, &sizes, &is_complex, &config).unwrap();
+        let node = TreeNode::from_nested(&outcome.full_anneal);
+        let audit = audit_tree(&node, &is_complex, &sizes, 0.0);
+        let base = outcome.full_anneal_pass_volume
+            + outcome.full_anneal_ride_volume
+            + outcome.full_anneal_merge_volume;
+        assert!(base > 0.0);
+        let rel = |x: f64, y: f64| (x - y).abs() / base;
+        assert!(rel(audit.pass_volume, outcome.full_anneal_pass_volume) < 1e-9);
+        assert!(rel(audit.ride_volume, outcome.full_anneal_ride_volume) < 1e-9);
+        assert!(rel(audit.merge_volume, outcome.full_anneal_merge_volume) < 1e-9);
+        let annealer_m = outcome.full_anneal_merge_volume / base;
+        let annealer_r = outcome.full_anneal_ride_volume / base;
+        assert!((audit.m - annealer_m).abs() < 1e-12);
+        assert!((audit.r - annealer_r).abs() < 1e-12);
+        assert!((audit.predicted_overhead - (1.0 + 2.0 * audit.m + audit.r)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn pre_w2_optimizer_config_still_deserializes() {
+        // Artifacts written before the W2 metadata extension must stay
+        // readable (new fields default to zero/empty).
+        let old = r#"{"algorithm":"omeco::TreeSA","version":"0.2.6","ntrials":10,"niters":50,"sc_target":40.0,"seed_base":42}"#;
+        let cfg: OptimizerConfig = serde_json::from_str(old).unwrap();
+        assert_eq!(cfg.anneal_steps, 0);
+        assert!(cfg.anneal_seeds.is_empty());
+        assert_eq!(cfg.merge_factor, 0.0);
     }
 
     #[test]

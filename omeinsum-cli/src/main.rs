@@ -90,9 +90,13 @@ enum Commands {
         #[arg(long)]
         expr: Option<String>,
 
-        /// Rewrite c32/c64 inputs as a real network before execution
-        #[arg(long)]
+        /// Rewrite c32/c64 inputs as a dense real cascade and re-plan it
+        #[arg(long, conflicts_with = "realify_tree")]
         realify: bool,
+
+        /// Rewrite c32/c64 inputs along the supplied contraction tree using Gauss factors
+        #[arg(long, conflicts_with = "realify")]
+        realify_tree: bool,
 
         /// Output file (default: stdout)
         #[arg(short, long)]
@@ -115,9 +119,13 @@ enum Commands {
         #[arg(long)]
         expr: Option<String>,
 
-        /// Rewrite c32/c64 inputs as a real network before differentiation
-        #[arg(long)]
+        /// Rewrite c32/c64 inputs as a dense real cascade and re-plan it
+        #[arg(long, conflicts_with = "realify_tree")]
         realify: bool,
+
+        /// Rewrite c32/c64 inputs along the supplied contraction tree using Gauss factors
+        #[arg(long, conflicts_with = "realify")]
+        realify_tree: bool,
 
         /// Gradient seed for the einsum output, using the Result JSON schema
         #[arg(long = "grad-output")]
@@ -174,6 +182,7 @@ fn main() {
             topology,
             expr,
             realify,
+            realify_tree,
             output,
             pretty,
         } => contract::run(
@@ -181,6 +190,7 @@ fn main() {
             topology.as_deref(),
             expr.as_deref(),
             realify,
+            realify_tree,
             output.as_deref(),
             pretty,
         ),
@@ -189,6 +199,7 @@ fn main() {
             topology,
             expr,
             realify,
+            realify_tree,
             grad_output,
             output,
             pretty,
@@ -197,6 +208,7 @@ fn main() {
             topology.as_deref(),
             expr.as_deref(),
             realify,
+            realify_tree,
             grad_output.as_deref(),
             output.as_deref(),
             pretty,

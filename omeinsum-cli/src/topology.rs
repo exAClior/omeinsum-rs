@@ -50,19 +50,20 @@ where
 
 pub(crate) fn validate_tree(
     tree: &NestedEinsum<usize>,
-    num_tensors: usize,
+    source_ixs: &[Vec<usize>],
     size_dict: &HashMap<usize, usize>,
     leaf_counts: &mut [usize],
-) -> Result<(), String> {
+) -> Result<Vec<usize>, String> {
     match tree {
         NestedEinsum::Leaf { tensor_index } => {
-            if *tensor_index >= num_tensors {
+            if *tensor_index >= source_ixs.len() {
                 return Err(format!(
-                    "Topology leaf tensor_index {tensor_index} out of range for {num_tensors} tensors"
+                    "Topology leaf tensor_index {tensor_index} out of range for {} tensors",
+                    source_ixs.len()
                 ));
             }
             leaf_counts[*tensor_index] += 1;
-            Ok(())
+            Ok(source_ixs[*tensor_index].clone())
         }
         NestedEinsum::Node { args, eins } => {
             if args.len() != 2 {
@@ -71,15 +72,28 @@ pub(crate) fn validate_tree(
                     args.len()
                 ));
             }
+            if eins.ixs.len() != 2 {
+                return Err(format!(
+                    "Topology binary node must contain two input index lists, found {}",
+                    eins.ixs.len()
+                ));
+            }
             for label in eins.ixs.iter().flatten().chain(eins.iy.iter()) {
                 if !size_dict.contains_key(label) {
                     return Err(format!("Topology references unknown label index {label}"));
                 }
             }
-            for arg in args {
-                validate_tree(arg, num_tensors, size_dict, leaf_counts)?;
+            let child_outputs = args
+                .iter()
+                .map(|arg| validate_tree(arg, source_ixs, size_dict, leaf_counts))
+                .collect::<Result<Vec<_>, _>>()?;
+            if eins.ixs != child_outputs {
+                return Err(format!(
+                    "Topology node input labels {:?} do not match child outputs {:?}",
+                    eins.ixs, child_outputs
+                ));
             }
-            Ok(())
+            Ok(eins.iy.clone())
         }
     }
 }

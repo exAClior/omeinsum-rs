@@ -6,10 +6,7 @@ use omeinsum::{
     Standard, Tensor,
 };
 
-#[path = "realify_support.rs"]
-mod realify_support;
-
-use realify_support::*;
+use super::realify_support::*;
 
 #[test]
 fn exact_integer_matmul_matches_design_vector() {

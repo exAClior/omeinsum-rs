@@ -331,6 +331,7 @@ pub(crate) fn contract(
             false,
         )
     };
+    let mut host_output_materialization = None;
     let output_device_plan = if let Some(perm) = plan.output_perm.as_ref() {
         let canonical_shape: Vec<usize> = plan
             .left_modes
@@ -354,15 +355,18 @@ pub(crate) fn contract(
                 current
             })
             .collect();
-        Some(
-            dense_permutation(
-                matmul_output.len(),
-                &canonical_shape,
-                &canonical_strides,
-                perm,
-            )?
-            .ok_or_else(|| AscendError::status("Ascend output permutation is not dense", -1))?,
-        )
+        let device_plan = dense_permutation(
+            matmul_output.len(),
+            &canonical_shape,
+            &canonical_strides,
+            perm,
+        )?;
+        if device_plan.is_none() {
+            // aclnnPermute supports at most rank 8. Keep high-rank contractions
+            // correct via the same host fallback used for operand views.
+            host_output_materialization = Some((canonical_shape, canonical_strides));
+        }
+        device_plan
     } else {
         None
     };
@@ -435,6 +439,16 @@ pub(crate) fn contract(
 
     if let Some(output) = final_output {
         Ok(output)
+    } else if let Some((canonical_shape, canonical_strides)) = host_output_materialization {
+        materialize(
+            runtime,
+            &matmul_output,
+            &canonical_shape,
+            &canonical_strides,
+            plan.output_perm
+                .as_ref()
+                .expect("host output materialization requires a permutation"),
+        )
     } else {
         Ok(matmul_output)
     }

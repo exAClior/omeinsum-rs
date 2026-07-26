@@ -25,6 +25,10 @@ mod omeinsum_compat;
 mod optimizer;
 #[path = "suites/realify.rs"]
 mod realify;
+#[path = "suites/realify_support.rs"]
+mod realify_support;
+#[path = "suites/realify_tree.rs"]
+mod realify_tree;
 #[path = "suites/showcase.rs"]
 mod showcase;
 #[cfg(feature = "tropical")]

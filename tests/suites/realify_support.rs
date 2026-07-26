@@ -1,11 +1,14 @@
+#![allow(dead_code)]
+
 use std::collections::HashMap;
 
 use approx::assert_relative_eq;
 use num_complex::Complex64;
-use omeinsum::realify::mul_vertex_tensor;
+use omeco::NestedEinsum;
+use omeinsum::realify::{merge_factor_tensors, mul_vertex_tensor};
 use omeinsum::{
-    realify_code, realify_data, split_re_im, Cpu, Einsum, RealifiedOutput, RealifyInput, Standard,
-    Tensor,
+    realify_code, realify_data, realify_tree_code, split_re_im, Cpu, Einsum, RealifiedOutput,
+    RealifyInput, RealifyTreePlan, Standard, Tensor,
 };
 
 #[derive(Clone)]
@@ -54,7 +57,7 @@ impl OwnedInput {
         }
     }
 
-    fn native_tensor(&self) -> Tensor<Complex64, Cpu> {
+    pub(super) fn native_tensor(&self) -> Tensor<Complex64, Cpu> {
         match self {
             OwnedInput::Real { data, shape } => {
                 let complex: Vec<Complex64> = data
@@ -81,7 +84,7 @@ impl OwnedInput {
         }
     }
 
-    fn realified_tensor(&self) -> Tensor<f64, Cpu> {
+    pub(super) fn realified_tensor(&self) -> Tensor<f64, Cpu> {
         match self {
             OwnedInput::Real { data, shape } => Tensor::from_data(data, shape),
             OwnedInput::Complex {
@@ -124,6 +127,59 @@ pub(super) fn execute_native(
     let mut einsum = Einsum::new(ixs.to_vec(), iy.to_vec(), infer_sizes(inputs, ixs));
     optimize(&mut einsum, execution);
     einsum.execute::<Standard<Complex64>, Complex64, Cpu>(&tensor_refs)
+}
+
+pub(super) fn execute_native_tree(
+    inputs: &[OwnedInput],
+    ixs: &[Vec<usize>],
+    iy: &[usize],
+    tree: NestedEinsum<usize>,
+) -> Tensor<Complex64, Cpu> {
+    let tensors: Vec<Tensor<Complex64, Cpu>> =
+        inputs.iter().map(OwnedInput::native_tensor).collect();
+    let tensor_refs: Vec<&Tensor<Complex64, Cpu>> = tensors.iter().collect();
+    let mut einsum = Einsum::new(ixs.to_vec(), iy.to_vec(), infer_sizes(inputs, ixs));
+    einsum.set_contraction_tree(tree);
+    einsum.execute::<Standard<Complex64>, Complex64, Cpu>(&tensor_refs)
+}
+
+pub(super) fn prepare_tree_realified(
+    inputs: &[OwnedInput],
+    ixs: &[Vec<usize>],
+    iy: &[usize],
+    tree: &NestedEinsum<usize>,
+) -> (RealifyTreePlan, Vec<Tensor<f64, Cpu>>) {
+    let is_complex: Vec<bool> = inputs.iter().map(OwnedInput::is_complex).collect();
+    let plan = realify_tree_code(tree, ixs, iy, &infer_sizes(inputs, ixs), &is_complex);
+    let mut tensors: Vec<Tensor<f64, Cpu>> =
+        inputs.iter().map(OwnedInput::realified_tensor).collect();
+
+    for &(u_position, v_position, w_position) in &plan.factor_vertex_positions {
+        assert_eq!(u_position, tensors.len());
+        assert_eq!(v_position, u_position + 1);
+        assert_eq!(w_position, v_position + 1);
+        let (u, w) = merge_factor_tensors::<f64, Cpu>(Cpu);
+        tensors.push(u.clone());
+        tensors.push(u);
+        tensors.push(w);
+    }
+    assert_eq!(tensors.len(), plan.einsum.ixs.len());
+    (plan, tensors)
+}
+
+pub(super) fn execute_tree_realified(
+    inputs: &[OwnedInput],
+    ixs: &[Vec<usize>],
+    iy: &[usize],
+    tree: &NestedEinsum<usize>,
+) -> (Tensor<f64, Cpu>, RealifiedOutput) {
+    let (plan, tensors) = prepare_tree_realified(inputs, ixs, iy, tree);
+    let output = plan.output;
+    let tensor_refs: Vec<&Tensor<f64, Cpu>> = tensors.iter().collect();
+    (
+        plan.einsum.execute::<Standard<f64>, f64, Cpu>(&tensor_refs),
+        output,
+    )
 }
 
 pub(super) fn execute_realified(

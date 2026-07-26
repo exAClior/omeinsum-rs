@@ -16,6 +16,10 @@ use crate::backend::{Backend, BackendScalar};
 use crate::einsum::Einsum;
 use crate::tensor::Tensor;
 
+mod tree;
+
+pub use tree::{realify_tree_code, RealifyTreePlan};
+
 /// Constant tensors for realified complex arithmetic.
 ///
 /// Data is column-major. The rank-3 tensors have shape `[2, 2, 2]`; matrices have
@@ -31,6 +35,19 @@ pub mod constants {
     /// This is exported for tests and graphical identities. Runtime realification
     /// inserts [`M_DATA`] instead, which has the trailing `Z` pre-absorbed.
     pub const C_DATA: [f64; 8] = [1.0, 0.0, 0.0, -1.0, 0.0, -1.0, -1.0, 0.0];
+
+    /// First input factor of the rank-3 multiplication decomposition.
+    ///
+    /// Shape `[2, 3]`; columns are the linear forms `x0`, `x1`, and `x0 + x1`.
+    pub const U_DATA: [f64; 6] = [1.0, 0.0, 0.0, 1.0, 1.0, 1.0];
+
+    /// Second input factor. Complex multiplication uses the same forms for both inputs.
+    pub const V_DATA: [f64; 6] = U_DATA;
+
+    /// Output factor of the rank-3 multiplication decomposition.
+    ///
+    /// Shape `[2, 3]`; `Re = p0 - p1`, `Im = p2 - p0 - p1`.
+    pub const W_DATA: [f64; 6] = [1.0, -1.0, -1.0, -1.0, 0.0, 1.0];
 
     /// Conjugation matrix `Z = diag(1, -1)`.
     pub const Z_DATA: [f64; 4] = [1.0, 0.0, 0.0, -1.0];
@@ -270,6 +287,23 @@ where
 {
     let data = constants::M_DATA.map(cast_f64::<T>);
     Tensor::from_data_with_backend(&data, &[2, 2, 2], backend)
+}
+
+/// Build the `U` (= `V`) and `W` tensors for a factorized tree merge.
+///
+/// Both tensors have shape `[2, 3]`. A merge uses the returned `U` tensor twice,
+/// once at each input position, and the `W` tensor once.
+pub fn merge_factor_tensors<T, B>(backend: B) -> (Tensor<T, B>, Tensor<T, B>)
+where
+    T: Scalar + Float,
+    B: Backend,
+{
+    let u = constants::U_DATA.map(cast_f64::<T>);
+    let w = constants::W_DATA.map(cast_f64::<T>);
+    (
+        Tensor::from_data_with_backend(&u, &[2, 3], backend.clone()),
+        Tensor::from_data_with_backend(&w, &[2, 3], backend),
+    )
 }
 
 /// One-shot realified einsum on a chosen backend.

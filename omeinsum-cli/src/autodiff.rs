@@ -8,7 +8,7 @@ use crate::common::{
     serialize_real_tensor_data, serialize_realified_complex_tensor_data, write_json_output,
 };
 use crate::format::{AutodiffResultFile, Dtype, GradientFile, TensorsFile};
-use crate::realify::{prepare, realify_tensor};
+use crate::realify::{prepare, realify_tensor, RealifyStrategy};
 
 /// Run the autodiff subcommand.
 pub fn run(
@@ -16,6 +16,7 @@ pub fn run(
     topology_path: Option<&str>,
     expr: Option<&str>,
     realify: bool,
+    realify_tree: bool,
     grad_output_path: Option<&str>,
     output: Option<&str>,
     pretty: Option<bool>,
@@ -25,6 +26,19 @@ pub fn run(
     if realify && matches!(tensors_file.dtype, Dtype::F32 | Dtype::F64) {
         return Err("--realify requires dtype c32 or c64".to_string());
     }
+    if realify_tree && matches!(tensors_file.dtype, Dtype::F32 | Dtype::F64) {
+        return Err("--realify-tree requires dtype c32 or c64".to_string());
+    }
+    if realify && realify_tree {
+        return Err("--realify and --realify-tree are mutually exclusive".to_string());
+    }
+    let strategy = if realify_tree {
+        Some(RealifyStrategy::Tree)
+    } else if realify {
+        Some(RealifyStrategy::Cascade)
+    } else {
+        None
+    };
 
     match tensors_file.dtype {
         Dtype::F32 => run_real(
@@ -47,20 +61,22 @@ pub fn run(
             |value| value,
             |value| value,
         ),
-        Dtype::C32 if realify => run_complex_realified(
+        Dtype::C32 if strategy.is_some() => run_complex_realified(
             &tensors_file,
             topology_path,
             expr,
+            strategy.expect("checked realify strategy"),
             grad_output_path,
             output,
             pretty,
             |re, im| Complex32::new(re as f32, im as f32),
             |value| value as f64,
         ),
-        Dtype::C64 if realify => run_complex_realified(
+        Dtype::C64 if strategy.is_some() => run_complex_realified(
             &tensors_file,
             topology_path,
             expr,
+            strategy.expect("checked realify strategy"),
             grad_output_path,
             output,
             pretty,
@@ -153,6 +169,7 @@ fn run_complex_realified<T>(
     tensors_file: &TensorsFile,
     topology_path: Option<&str>,
     expr: Option<&str>,
+    strategy: RealifyStrategy,
     grad_output_path: Option<&str>,
     output: Option<&str>,
     pretty: Option<bool>,
@@ -164,7 +181,7 @@ where
     num_complex::Complex<T>: Scalar + BackendScalar<Cpu>,
     Standard<T>: Algebra<Scalar = T, Index = u32>,
 {
-    let prepared = prepare(tensors_file, topology_path, expr, make_complex)?;
+    let prepared = prepare(tensors_file, topology_path, expr, strategy, make_complex)?;
     let grad_output = match grad_output_path {
         Some(path) => {
             let complex = load_complex_result_tensor(

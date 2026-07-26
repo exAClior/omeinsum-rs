@@ -23,8 +23,9 @@ num-complex = { version = "0.4", features = ["bytemuck"] }
 # High-performance GEMM for Standard algebra
 faer = "0.24"
 
-# Contraction order optimization
-omeco = "0.2.4"
+# Contraction order optimization. Pinned to exAClior/omeco (green-sa branch)
+# for the GreenAnnealer second-stage optimizer (RealifyTN campaign W2).
+omeco = { git = "https://github.com/exAClior/omeco.git", rev = "193b3bb" }
 
 # Optional: Tropical algebra support. tropical-gemm and tropical-gemm-cuda must
 # resolve to the same crate version so the CPU and GPU tropical paths share one

@@ -86,6 +86,8 @@ omeinsum contract tensors.json --expr "(ij,jk),kl->il"
 | `<tensors>` | yes | Path to tensors JSON file |
 | `-t, --topology` | one of `-t` or `--expr` | Topology JSON from `optimize` |
 | `--expr` | one of `-t` or `--expr` | Parenthesized expression (see below) |
+| `--realify` | no | For c32/c64, build a dense real cascade and greedily re-plan it |
+| `--realify-tree` | no | For c32/c64, follow the supplied tree with factorized Gauss merges |
 | `-o, --output` | no | Output file (default: stdout) |
 | `--pretty` | no | `true` or `false`; auto-detects TTY when omitted |
 
@@ -106,11 +108,31 @@ omeinsum autodiff tensors.json --expr "ij,jk->ik" --grad-output dy.json -o autod
 | `<tensors>` | yes | Path to tensors JSON file |
 | `-t, --topology` | one of `-t` or `--expr` | Topology JSON from `optimize` |
 | `--expr` | one of `-t` or `--expr` | Parenthesized expression (same parser as `contract`) |
+| `--realify` | no | For c32/c64, differentiate a greedily replanned dense real cascade |
+| `--realify-tree` | no | For c32/c64, differentiate the factorized supplied tree |
 | `--grad-output` | required for non-scalar outputs | Gradient seed for the einsum output, using the Result JSON schema |
 | `-o, --output` | no | Output file (default: stdout) |
 | `--pretty` | no | `true` or `false`; auto-detects TTY when omitted |
 
 If `--grad-output` is omitted, the forward result must be scalar and the CLI uses a unit seed automatically. For complex dtypes, that unit seed is `1 + 0i`.
+
+### Complex-to-real execution
+
+`--realify` and `--realify-tree` are mutually exclusive and require `c32` or `c64`
+inputs. Both execute only real arithmetic internally and reconstruct complex JSON at
+the boundary. The distinction is scheduling:
+
+- `--realify` inserts dense multiplication vertices as a cascade, then greedily
+  replans the expanded network.
+- `--realify-tree` starts from the exact tree supplied by `-t` or `--expr`. A node
+  with two complex children becomes a fixed `U/V/W` subtree implementing Gauss's
+  three-real-product multiplication; the generated tree is not re-optimized.
+
+Use `--realify-tree` when an archived order must be preserved, for autodiff through
+the static real graph, or when targeting a graph compiler. Its Gauss linear forms
+have the usual 3M floating-point caveat: extreme finite inputs can overflow or lose
+cancellation where dense 4M remains finite. Use `--realify` when that wider numerical
+range matters more than preserving the source schedule.
 
 ## Parenthesized Expressions
 

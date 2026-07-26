@@ -110,13 +110,17 @@ make cli                    # install to ~/.cargo/bin
 omeinsum optimize "ij,jk->ik" --sizes "i=2,j=3,k=2" -o topo.json
 omeinsum contract tensors.json -t topo.json
 omeinsum autodiff tensors.json --expr "ii->"
-# c32/c64: execute and differentiate through an equivalent real network
+# c32/c64: execute through an equivalent real network
 omeinsum contract complex-tensors.json --expr "ij,jk->ik" --realify
+# Preserve the supplied tree and use the factorized Gauss three-product schedule
+omeinsum contract complex-tensors.json -t topo.json --realify-tree
 ```
 
-`--realify` is currently a CPU CLI path. It rewrites c32/c64 networks into real
-arithmetic and restores complex result JSON; library callers can run the same
-transformed network on any backend supporting the corresponding real scalar type.
+Both flags are currently CPU CLI paths and restore complex result/gradient JSON.
+`--realify` builds the legacy dense cascade and replans it; `--realify-tree` follows
+the supplied topology or parenthesized expression exactly and emits factorized
+`U/V/W` merge subtrees. Library callers can execute the transformed real network on
+any backend supporting the corresponding real scalar type.
 
 See the [CLI documentation](https://tensor4all.github.io/omeinsum-rs/cli.html) for JSON formats, parenthesized expressions, and a full walkthrough.
 

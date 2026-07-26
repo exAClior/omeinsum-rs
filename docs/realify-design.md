@@ -3,6 +3,13 @@
 **Status:** core implemented (M0–M2), with CPU and Ascend benchmark harnesses,
 M4 CLI support, final-only complex recovery, and an M5 feature-gated Ascend test.
 The 2026-07-22 Ascend study establishes correctness and the performance crossover.
+**M6 implemented (2026-07-23), GPU/Ascend campaign complete (2026-07-24):**
+tree-following realification with the rank-3-factorized multiplication vertex — the
+ComplexTN.jl construction ported to Rust. The library transform, installed-tree
+execution and AD, `--realify-tree` CLI, and four-mode benchmark harness are verified.
+Matched A800/Ascend measurements show that `3 : 3 : 4` predicts core multiplication
+arithmetic, not wall time: the `4/3` dense/factorized ratio appears on the
+contraction-dominated Ascend case, but not on CUDA (§5 M6d).
 **Goal:** contract complex-valued tensor networks on backends without native complex
 support (today: Ascend, which is f32-only; also CUDA builds without cuTENSOR) by
 mechanically rewriting the network into an equivalent real-valued network, with no
@@ -118,6 +125,16 @@ risks are:
 - Gauss's trick (3 real multiplications instead of 4) is a possible later fusion; not
   in scope for v1.
 
+**2026-07-23 revision.** The 4× temporary above is inherent to the *dense* `M` under
+binary trees — both pairwise orders through a 3-leg vertex leave two dim-2 legs on
+an intermediate. It is **not** inherent to realification: the rank-3 factorization of
+`M` (§1.6) expresses exactly the Gauss 3-multiplication schedule as ordinary binary
+contractions, with no fused kernel and no three-input lowering. M6 adopts the
+factorized vertex for the tree-following path; the dense vertex stays for the v1
+cascade and for identity tests. This retires the "fused multiplication-vertex
+lowering" and "Gauss 3-mult fusion" stretch bullets in M5 — the factorized static
+form achieves both, in graph structure rather than in kernel code.
+
 ### 1.5 Exact integer test vector (paste into tests)
 
 ```text
@@ -134,6 +151,40 @@ Network: ixs = [[0,1,10], [1,2,11], [10,11,12]]  (labels 10,11,12 are the extra 
          tensors = [T_A, T_B, M]
          sizes: 0↦2, 1↦2, 2↦2, 10↦2, 11↦2, 12↦2
 ```
+
+### 1.6 The factorized multiplication vertex (M6, verified against `M_DATA`)
+
+`M` has tensor rank 3 (Winograd): exactly three rank-1 terms suffice, and two
+cannot. The decomposition is Gauss's multiplication algorithm written as tensor
+factors — `U`, `V` shape `[2,3]`, `W` shape `[2,3]`, column-major:
+
+```rust
+/// U = V = [[1,0,1],[0,1,1]]; the three linear forms x0, x1, x0+x1.
+pub const U_DATA: [f64; 6] = [1.0, 0.0,   0.0, 1.0,   1.0, 1.0];
+/// W = [[1,-1,0],[-1,-1,1]]; Re = p1 - p2, Im = p3 - p1 - p2.
+pub const W_DATA: [f64; 6] = [1.0, -1.0,  -1.0, -1.0,  0.0, 1.0];
+```
+
+Identity (unit test, all 8 entries): `M[a,b,c] = Σ_k U[a,k] V[b,k] W[c,k]`, `k` a
+fresh label of size 3 per merge site.
+
+A tree node contracting green children `X[…,a]`, `Y[…,b]` over skeleton labels `S`
+becomes a 4-step subtree of ordinary binary contractions:
+
+1. `X′ ← contract(X, U)` over `a` — cheap, surface-size;
+2. `Y′ ← contract(Y, V)` over `b` — cheap;
+3. `Z″ ← contract(X′, Y′)` over `S`, with `k` a **batch** label (in both inputs and
+   the output) — exactly 3× the skeleton contraction;
+4. `Z ← contract(Z″, W)` over `k`, emitting the node's single dim-2 green leg `c`.
+
+The 3× merge cost is **structural, not optimizer-dependent**: alternative pairwise
+schedules of this subtree sum `k` too early and cost 6× the skeleton step, so any
+working optimizer keeps the intended order. Total per merge: 3× skeleton +
+O(surface). Numerically this is Gauss's algorithm — identical error behavior to the
+`real_walk` merge arm and to 3M generally. Its linear forms can overflow or lose
+cancellation for extreme finite operands where dense 4M remains finite; the
+legacy dense path is the deliberate numerical-range fallback. This is the reason
+to keep dense `M` beyond identity tests.
 
 ---
 
@@ -216,8 +267,37 @@ Neither should need code changes to *use* the feature — it is a pure omeinsum 
   the optimizer can still schedule merges anywhere. M3 found two Re/Im legs in each
   measured binary intermediate; §1.4 proves tree alignment alone cannot reduce that
   count, so a future optimization must fuse multiplication-vertex lowering.
+  **2026-07-23 revision:** the §1.4 limitation is specific to the *dense* vertex;
+  see D10–D12 for the tree-following factorized path (M6). The cascade remains the
+  CLI convenience form; it is saved in practice by re-optimization (the ComplexTN.jl
+  benchmark suite measured ≤1% cost difference between convert-only and fully
+  re-annealed orders — the optimization landscape is flat). The unsafe direction is
+  the reverse one: wiring merges in a fixed order *before* optimization without a
+  re-plan (ComplexTN.jl measured a 1555× blow-up on a 16-qubit circuit from
+  time-ordered wiring). M6 never pre-wires: it attaches to an already-optimized tree.
 - **D9 — Output is explicit about whether a trailing Re/Im axis exists** (see
   `RealifiedOutput`), so `m == 0` (all-real network) is not a silent special case.
+- **D10 — Tree-following realification (M6) mirrors an archived contraction tree.**
+  Given a `NestedEinsum` already optimized on the complex topology (omeco TreeSA),
+  each internal node maps to one of three static patterns: *pass* (neither child
+  green: unchanged binary step), *ride* (one child green: the dim-2 leg rides to the
+  node's output), *merge* (both green: the 4-step factorized subtree of §1.6).
+  Invariant: every intermediate outside the merge subtrees carries at most one
+  dim-2 green leg, so its logical payload is at most 2× the real skeleton. The local
+  merge subtree also carries a size-3 rank leg. This is the ComplexTN.jl
+  `_nested_append` construction, with the dense `𝒞` replaced by the rank-3
+  factorization so literal execution hits 3× instead of 4×.
+- **D11 — The tree-realified network is executed in the archived order, never
+  re-optimized.** The output plan carries its realified `NestedEinsum` and installs
+  it via `set_contraction_tree`. Re-optimization is pointless (flat landscape,
+  ≤1%) and would only risk disturbing the topology-protected 3× schedule (§1.6).
+- **D12 — Factorized vertex for the tree path, dense vertex for the cascade path.**
+  Both are exact; they differ in execution cost under binary engines (3× vs 4× per
+  merge) and in numerics (Gauss vs 4M error constants). The `real_walk` dispatch
+  executor stays as-is: its merge arm *is* the factorized schedule in host code, so
+  M6 adds the graph form of the same arithmetic — the value is AD-for-free through
+  `backward.rs` (the walker is outside the gradient tape) and a static artifact for
+  graph-compiler ingestion, not a flop count change.
 
 ---
 
@@ -329,10 +409,50 @@ Notes:
 - The M vertex tensor for `T = f32` is `M_DATA.map(|x| x as f32)`; keep a small
   helper `mul_vertex_tensor::<T, B>(backend) -> Tensor<T, B>`.
 
+### 4.1 Tree-following API (M6, planned)
+
+```rust
+/// Result of the tree-following topology transform. Pure structure — no tensor data.
+pub struct RealifyTreePlan {
+    /// Flat spec of the realified network (original ixs with green labels appended
+    /// to complex inputs, plus U/V/W factor leaves), with the realified
+    /// `NestedEinsum` already installed via `set_contraction_tree`.
+    pub einsum: Einsum<usize>,
+    /// Positions of the inserted factor-tensor leaves, per merge site: (u, v, w).
+    pub factor_vertex_positions: Vec<(usize, usize, usize)>,
+    pub output: RealifiedOutput,
+}
+
+/// Pure tree-following transform (D10). `tree` is the archived optimized
+/// contraction tree of the *complex* network; `is_complex[k]` ⇔ input k gets a
+/// green leg. Fresh labels (green, size 2; rank, size 3) start at
+/// max(all labels) + 1 and must not collide with cut labels in sliced artifacts.
+pub fn realify_tree_code(
+    tree: &NestedEinsum<usize>,
+    ixs: &[Vec<usize>],
+    iy: &[usize],
+    size_dict: &std::collections::HashMap<usize, usize>,
+    is_complex: &[bool],
+) -> RealifyTreePlan;
+
+/// The U (= V) and W factor tensors on a backend, mirroring `mul_vertex_tensor`.
+pub fn merge_factor_tensors<T, B>(backend: B) -> (Tensor<T, B>, Tensor<T, B>);
+```
+
+- Data conversion reuses M1's `realify_data` unchanged (leaf conversion,
+  `conjugate` flag); recovery reuses `split_re_im` / `recover_complex`.
+- Execution is the stock engine — `plan.einsum.execute::<Standard<T>, _, _>(…)` —
+  which walks the installed tree; no new executor, no dispatch code.
+- AD is the stock tape: `einsum_with_grad` / `cost_and_gradient` on the plan's flat
+  spec. If the tape re-plans internally, gradients are unaffected (order-invariant
+  values); assert values, and separately assert the forward schedule follows the
+  installed tree on the direct `execute` path.
+
 ## 5. Milestones
 
 Each milestone ends green under `make check`. Wire the new integration suite into
-`tests/main.rs` as `#[path = "suites/realify.rs"] mod realify;` (M2).
+`tests/main.rs` as `#[path = "suites/realify.rs"] mod realify;` (M2); the M6 suite
+is `suites/realify_tree.rs`.
 
 ### M0 — constants + topology transform (no tensor data)
 
@@ -435,13 +555,95 @@ Files: `omeinsum-cli/src/contract.rs`, `autodiff.rs`, `format.rs`.
   so gradients are for `Re(y)`. Gradients for internal multiplication vertices are
   discarded before writing one complex gradient per source input.
 
+### M6 — tree-following realification with factorized vertex (implemented, 2026-07-23)
+
+Port of the ComplexTN.jl construction (`real_convert` / `_nested_append`), upgraded
+with the rank-3 factorized vertex (§1.6, D10–D12). Motivation, in order: (1) the
+`real_walk` dispatch executor sits outside the `backward.rs` gradient tape, so the
+dispatch path has no autodiff — the static graph differentiates for free;
+(2) a static real einsum is the artifact static-graph accelerator compilers ingest;
+(3) it enables the decisive three-way hardware comparison — dispatch vs
+static-factorized vs static-dense — whose arithmetic prediction is 3 : 3 : 4.
+
+#### M6a — factorized constants + pure tree transform (implemented)
+
+Files: `src/realify.rs` (or `src/realify/tree.rs` if the module splits).
+
+- `constants::{U_DATA, V_DATA, W_DATA}`; unit test the identity
+  `M[a,b,c] = Σ_k U[a,k] V[b,k] W[c,k]` against `M_DATA` (all 8 entries, exact).
+- `realify_tree_code` on `NestedEinsum<usize>`: pass/ride/merge node mapping (D10);
+  fresh-label allocation reusing `allocate_fresh_labels` (green size 2, rank size 3);
+  `m == 0` identity plan, `m == 1` single leg, no factor leaves.
+- Unit tests (inline): plan shapes on hand-built trees covering all three node
+  types; the one-green-leg invariant walked over every internal node; label
+  freshness against a sparse `size_dict` with high labels and against archived cut
+  labels; `m ∈ {0, 1}` cases.
+
+#### M6b — end-to-end execution + oracle suite (implemented)
+
+Files: `src/realify.rs`, `tests/suites/realify_tree.rs` (new), `tests/main.rs` (wire-in).
+
+Oracle: native `Standard<Complex64>` on `Cpu`; cross-check against the cascade
+`realify_einsum` and, in the examples harness, against `real_walk`. Tests prove
+values (f64, tol 1e-10): mixed real/complex networks with pass/ride/merge nodes all
+present; a `conjugate: true` sandwich; permuted `iy`; scalar output → shape `[2]`;
+merges at shallow and deep tree positions; one sliced network with cuts on skeleton
+labels only (green/rank labels are never cut).
+
+#### M6c — AD parity (implemented)
+
+- `cost_and_gradient` on a tree-realified scalar network uses the installed tree;
+  gradients match finite differences on source entries and the conjugate of
+  `backward.rs`'s holomorphic complex derivative, which is the complex representation
+  of the real objective gradient. (`einsum_with_grad` deliberately remains a one-shot
+  API that constructs and greedily plans a new `Einsum`, so it is not the schedule
+  preservation test.)
+- Forward `execute` and `cost_and_gradient` both consume the installed tree; structural
+  tests prove every merge is the intended four-step subtree.
+
+#### M6d — CLI + three-way benchmark + docs (GPU/Ascend campaign complete)
+
+Files: `omeinsum-cli/src/{contract,autodiff}.rs`, `examples/network_benchmark.rs` +
+`examples/support/`, this document (status), NPUBenchmarkData manifest (separate repo change).
+
+- `--realify-tree` for `contract` and `autodiff` consumes the archived topology tree
+  or an explicitly parenthesized expression tree (contrast `--realify`, which
+  cascades and replans greedily). Implemented.
+- The network benchmark example now has *dispatch* (`tree-real` alias),
+  *static-factorized*, *static-dense*, and *native-complex* modes. Static-factorized
+  uses the public M6 transform; static-dense is a benchmark-local tree transform so
+  the diagnostic 4× path does not become public API. Sliced CPU parity tests pass.
+- Matched CUDA/Ascend f32 runs used three immutable NPUBenchmarkData artifacts, their
+  exact archived trees, 3 warmups, and 10 synchronized full-solve repetitions. Every
+  timed configuration passed its CPU-native check. Durable samples and provenance are
+  in NPUBenchmarkData `results/m6-static-realification-v1/` at benchmark execution
+  commit `b604235ec86b24a0219ace7c469dd3a45b639469`; the tested omeinsum revision is
+  `61cd6b9adc6d7ae42aafda67c4979cd54233b403`.
+- Median dense/static-factorized ratios were CUDA `0.708`, `0.914` (bimodal;
+  inconclusive), `0.780`, and Ascend `0.812`, `0.787`, `1.367` for `test`,
+  rectangular-4x4-d16, and bristlecone-48-d16 respectively. Thus the arithmetic
+  `4/3` appears only in the contraction-dominated Ascend point: factorization cut
+  its dense median from `244.803 ms` to `179.036 ms` (26.9%). CUDA's robust points
+  favored dense static execution despite its fourth product.
+- Dispatch and static factorization are not wall-time-equivalent. On the substantive
+  CUDA cases dispatch beat static factorization; on Ascend static factorization beat
+  the current dispatch path. The latter alone required rank-greater-than-8 output
+  materialization through the host, so it is correctness evidence and current-backend
+  performance, not a lower bound for an all-device implementation. Three artifacts
+  do not establish a universal crossover threshold; profiling and another large
+  Ascend point are still warranted. A separate CPU performance sweep was not part of
+  this hardware request.
+
 ### M5 — stretch (each independent, do only when justified)
 
 - **Fused multiplication-vertex lowering**: recognize the `A,B,M` realification
   motif and emit a fused operation that never materializes its two-leg temporary.
-  A custom binary tree cannot provide this guarantee (§1.4).
+  A custom binary tree cannot provide this guarantee (§1.4). *Superseded for new
+  work by M6: the factorized vertex (§1.6) reaches 3× in graph structure with no
+  kernel work; this bullet would now only benefit the legacy cascade path.*
 - **Gauss 3-mult fusion** at binary-contract level (needs kernel-side work; only if
-  profiling shows the 4th GEMM matters).
+  profiling shows the 4th GEMM matters). *Superseded likewise — §1.6 is the Gauss
+  schedule as tensor factors.*
 - **`R_φ` / phase utilities** and an explicit-opt-in `detect_real` helper.
 - **Ascend integration test** behind the `ascend` feature flag, c32 → f32 network,
   guarded like the CUDA suites. Implemented in `tests/suites/ascend.rs`; it requires
@@ -462,6 +664,18 @@ Files: `omeinsum-cli/src/contract.rs`, `autodiff.rs`, `format.rs`.
       values after permuted-`iy` tests, which is where this would break).
 - [x] No `unsafe`, no backend-specific code paths in `realify.rs`.
 
+M6 additions (planned):
+
+- [x] `U,V,W → M` identity holds exactly (all 8 entries).
+- [x] Every intermediate outside merge subtrees carries ≤ 1 green leg; every merge
+      subtree is the §1.6 4-step pattern with its own fresh size-3 rank label.
+- [x] Forward execution follows the installed archived tree (no replanning).
+- [x] Values match the native complex oracle, the cascade path, and benchmark
+      `real_walk`; real-objective gradients match finite differences and the
+      conjugated native holomorphic derivative.
+- [x] Green and rank labels never collide with archived cut labels; slicing cuts
+      only skeleton labels.
+
 ## 7. Verification commands
 
 ```bash
@@ -469,6 +683,12 @@ make check                      # canonical gate: fmt + clippy + non-GPU tests
 cargo test --test main realify  # integration suite only
 cargo test realify              # + inline unit tests
 cargo bench --bench realify     # M3
+
+# M6
+cargo test --test main realify_tree          # integration suite
+cargo test 'realify::tree' --lib             # inline unit tests
+cargo test -p omeinsum-cli realify_tree      # CLI flag cases
+cargo test --example network_benchmark       # static/dispatch sliced parity
 ```
 
 Implementation verification on 2026-07-22:
@@ -485,6 +705,24 @@ Implementation verification on 2026-07-22:
   empty application and scheduler stderr, success marker and matching binary hash).
 - `make check` passed.
 
+M6 implementation verification on 2026-07-23:
+
+- `cargo test 'realify::tree' --lib` passed (8 transform/identity/validation tests).
+- `cargo test --test main realify_tree` passed (5 native/cascade/value/AD/slicing tests).
+- `cargo test -p omeinsum-cli realify_tree` passed (6 CLI cases).
+- `cargo test --example network_benchmark` passed (6 tests, including sliced parity
+  for dispatch, static-factorized, static-dense, and native execution).
+- `make check` passed (format, clippy with tropical/parallel, 550 tests plus docs;
+  11 known ignored unit tests and 4 ignored doctests).
+- Matched final hardware runs completed on A800 (`m6-final-gpu-20260724`) and Ascend
+  910 (HPC4 Slurm job `109459`, exit `0:0`) from clean, pinned revisions. All 21 timed
+  configurations passed CPU checks. `isPANN/runscribe` was unavailable (upstream URLs
+  returned HTTP 404), so the predeclared NPUBenchmarkData manifest/provenance fallback
+  captured commits, input hashes, device inventories, commands, logs, and samples.
+- The Ascend campaign exposed and verified the rank-greater-than-8 output-permutation
+  fallback in `src/backend/ascend/contract.rs`; the final fail-fast run completed all
+  dispatch and static modes. See M6d for the scoped performance conclusion.
+
 ## 8. References
 
 - *tnet.pdf* pp. 23–25 ("Complex Numbers: A Tensor-Network Perspective"): eq. 23
@@ -497,3 +735,12 @@ Implementation verification on 2026-07-22:
 - Consumer shapes: `benches/complex_tdvp.rs` (this repo);
   `rydbergsim-rs/crates/rydberg-tn/src/{contraction,gse}.rs` (CPU complex today);
   `yao-rs/src/einsum.rs` (`circuit_to_einsum`, `ArrayD<Complex64>`).
+- ComplexTN.jl (M6 source of the construction): `src/real_convert.jl`
+  (`_nested_append`, dense `𝒞` variant), `articles/2026-07-23-realified-tn/main.typ`
+  (cost law 1+2m+r; flat-landscape result; 1555× fixed-wiring blow-up; Winograd
+  rank-3 bound), `benchmarks/paper/{greensa,wallclock}.jl` (the green-aware SA and
+  the three-executor race — the instruments behind D8's revision and D11).
+- NPUBenchmarkData `experiments/20260724-m6-static-realification-v1.yaml` and
+  `results/m6-static-realification-v1/`: immutable M6 campaign definition, complete
+  samples, correctness comparisons, scoped conclusions, and provenance. The archived
+  artifact format originates in `experiments/20260723-all-circuits-overlap-v1.yaml`.

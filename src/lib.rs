@@ -73,8 +73,8 @@ pub use algebra::{Algebra, Complex32, Complex64, GenericSemiring, Semiring, Stan
 pub use backend::{Backend, BackendScalar, Cpu, Storage};
 pub use einsum::{cost_and_gradient, einsum, einsum_with_grad, EinBuilder, Einsum};
 pub use realify::{
-    realify_code, realify_data, realify_einsum, recover_complex, split_re_im, RealifiedOutput,
-    RealifyInput, RealifyPlan,
+    merge_factor_tensors, realify_code, realify_data, realify_einsum, realify_tree_code,
+    recover_complex, split_re_im, RealifiedOutput, RealifyInput, RealifyPlan, RealifyTreePlan,
 };
 pub use tensor::{Tensor, TensorView};
 
